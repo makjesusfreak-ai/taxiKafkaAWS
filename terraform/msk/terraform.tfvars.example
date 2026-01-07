@@ -1,0 +1,65 @@
+# Example terraform.tfvars file
+# Copy this file to terraform.tfvars and customize the values
+
+aws_region   = "us-east-1"
+environment  = "dev"
+cluster_name = "taxi-kafka-msk"
+
+# Kafka version
+kafka_version = "3.6.0"
+
+# Broker configuration
+number_of_broker_nodes = 3
+broker_instance_type   = "kafka.m5.large"
+broker_ebs_volume_size = 100
+
+# Provisioned throughput (set to true for high-throughput workloads)
+provisioned_throughput_enabled = false
+volume_throughput              = 250
+
+# Networking
+vpc_cidr              = "10.0.0.0/16"
+public_access_enabled = false
+
+# Encryption
+encryption_in_transit_client_broker = "TLS"
+encryption_in_transit_in_cluster    = true
+
+# Authentication
+sasl_iam_enabled               = true
+sasl_scram_enabled             = false
+unauthenticated_access_enabled = false
+
+# Logging
+log_retention_days = 7
+
+# Kafka Configuration
+log_retention_hours        = 168
+default_partitions         = 3
+default_replication_factor = 3
+min_insync_replicas        = 2
+
+# Monitoring
+enhanced_monitoring   = "PER_BROKER"
+jmx_exporter_enabled  = true
+node_exporter_enabled = true
+
+# Lambda Configuration
+lambda_timeout           = 60
+lambda_memory_size       = 256
+lambda_batch_size        = 100
+lambda_starting_position = "LATEST"
+kafka_topics             = ["taxi-rides", "taxi-locations"]
+consumer_group_id        = ""
+
+# AppSync Configuration
+appsync_auth_type           = "API_KEY"
+appsync_api_key_expiry_days = 365
+cognito_user_pool_id        = ""
+create_appsync_vpc_endpoint = false
+
+# Schema Registry Configuration
+schema_data_format       = "AVRO"
+schema_compatibility     = "BACKWARD"
+create_default_schemas   = true
+schema_auto_registration = true

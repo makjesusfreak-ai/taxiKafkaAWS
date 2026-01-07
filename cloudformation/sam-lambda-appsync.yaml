@@ -1,0 +1,729 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Lambda, AppSync Event API with DynamoDB persistence and Delta Sync for MSK integration'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: taxi-kafka-msk
+
+  Environment:
+    Type: String
+    Default: dev
+
+  MSKClusterArn:
+    Type: String
+    Description: ARN of the MSK cluster (from msk-infrastructure stack)
+
+  VPCId:
+    Type: String
+    Description: VPC ID (from msk-infrastructure stack)
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs (from msk-infrastructure stack)
+
+  MSKSecurityGroupId:
+    Type: String
+    Description: MSK Security Group ID (from msk-infrastructure stack)
+
+  GlueRegistryArn:
+    Type: String
+    Description: Glue Schema Registry ARN (from msk-infrastructure stack)
+
+  DeltaSyncTableTTL:
+    Type: Number
+    Default: 86400
+    Description: TTL in seconds for Delta Sync table (default 24 hours)
+
+  HistoricalDataRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Days to retain historical data in DynamoDB
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.12
+
+Resources:
+  # ==========================================
+  # DynamoDB Tables
+  # ==========================================
+  
+  # Main events table for historical data
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClusterName}-events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: topic
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: topic-timestamp-index
+          KeySchema:
+            - AttributeName: topic
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: pk
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-events'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Delta Sync table for tracking changes
+  DeltaSyncTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClusterName}-delta-sync'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ds_pk
+          AttributeType: S
+        - AttributeName: ds_sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ds_pk
+          KeyType: HASH
+        - AttributeName: ds_sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-delta-sync'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # Security Groups
+  # ==========================================
+  
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-lambda-sg'
+      GroupDescription: Security group for Lambda function
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-lambda-sg'
+
+  MSKIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MSKSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 9092
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Allow Lambda to connect to MSK
+
+  # ==========================================
+  # AppSync Event API (Real-time)
+  # ==========================================
+  
+  AppSyncEventsApi:
+    Type: AWS::AppSync::Api
+    Properties:
+      Name: !Sub '${ClusterName}-events-api'
+      EventConfig:
+        AuthProviders:
+          - AuthType: API_KEY
+        ConnectionAuthModes:
+          - AuthType: API_KEY
+        DefaultPublishAuthModes:
+          - AuthType: API_KEY
+        DefaultSubscribeAuthModes:
+          - AuthType: API_KEY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-events-api'
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AppSyncEventsApi.ApiId
+
+  # Channel Namespaces
+  KafkaChannelNamespace:
+    Type: AWS::AppSync::ChannelNamespace
+    Properties:
+      ApiId: !GetAtt AppSyncEventsApi.ApiId
+      Name: kafka
+      PublishAuthModes:
+        - AuthType: API_KEY
+      SubscribeAuthModes:
+        - AuthType: API_KEY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-kafka-namespace'
+
+  TaxiChannelNamespace:
+    Type: AWS::AppSync::ChannelNamespace
+    Properties:
+      ApiId: !GetAtt AppSyncEventsApi.ApiId
+      Name: taxi
+      PublishAuthModes:
+        - AuthType: API_KEY
+      SubscribeAuthModes:
+        - AuthType: API_KEY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-taxi-namespace'
+
+  # ==========================================
+  # AppSync GraphQL API (Historical Queries + Delta Sync)
+  # ==========================================
+  
+  AppSyncGraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ClusterName}-graphql-api'
+      AuthenticationType: API_KEY
+      XrayEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-graphql-api'
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppSyncGraphQLApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+
+  # GraphQL Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      Definition: |
+        type TaxiEvent {
+          id: ID!
+          topic: String!
+          partition: Int
+          offset: Int
+          timestamp: AWSTimestamp!
+          key: String
+          data: AWSJSON!
+          processedAt: AWSDateTime!
+          ttl: Int
+          _version: Int
+          _lastChangedAt: AWSTimestamp
+          _deleted: Boolean
+        }
+        
+        type TaxiEventConnection {
+          items: [TaxiEvent]
+          nextToken: String
+          startedAt: AWSTimestamp
+        }
+        
+        input EventFilterInput {
+          topic: String
+          startTime: AWSTimestamp
+          endTime: AWSTimestamp
+          key: String
+        }
+        
+        type Query {
+          getEvent(id: ID!): TaxiEvent
+          
+          listEvents(
+            filter: EventFilterInput
+            limit: Int
+            nextToken: String
+          ): TaxiEventConnection
+          
+          queryEventsByTopic(
+            topic: String!
+            startTime: AWSTimestamp
+            endTime: AWSTimestamp
+            limit: Int
+            nextToken: String
+          ): TaxiEventConnection
+          
+          syncEvents(
+            lastSync: AWSTimestamp
+            nextToken: String
+            limit: Int
+          ): TaxiEventConnection
+          
+          getLatestEvents(
+            topic: String
+            limit: Int
+          ): TaxiEventConnection
+        }
+        
+        type Mutation {
+          createEvent(
+            topic: String!
+            partition: Int
+            offset: Int
+            key: String
+            data: AWSJSON!
+          ): TaxiEvent
+        }
+        
+        type Subscription {
+          onCreateEvent(topic: String): TaxiEvent
+            @aws_subscribe(mutations: ["createEvent"])
+        }
+        
+        schema {
+          query: Query
+          mutation: Mutation
+          subscription: Subscription
+        }
+
+  # DynamoDB Data Source for Events Table
+  EventsTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      Name: EventsTable
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: !Ref AWS::Region
+        TableName: !Ref EventsTable
+        Versioned: true
+        DeltaSyncConfig:
+          BaseTableTTL: !Ref HistoricalDataRetentionDays
+          DeltaSyncTableName: !Ref DeltaSyncTable
+          DeltaSyncTableTTL: !Ref DeltaSyncTableTTL
+
+  # AppSync Service Role
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-appsync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt EventsTable.Arn
+                  - !Sub '${EventsTable.Arn}/index/*'
+                  - !GetAtt DeltaSyncTable.Arn
+                  - !Sub '${DeltaSyncTable.Arn}/index/*'
+
+  # ==========================================
+  # AppSync Resolvers
+  # ==========================================
+  
+  GetEventResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getEvent
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          // id format: topic-partition-offset (e.g., "taxi-trips-0-123")
+          const idParts = ctx.args.id.split('-');
+          if (idParts.length >= 3) {
+            // Extract offset (last part), partition (second to last), topic (everything else)
+            const offset = idParts.pop();
+            const partition = idParts.pop();
+            const topic = idParts.join('-');
+            return {
+              operation: 'GetItem',
+              key: util.dynamodb.toMapValues({ pk: `TOPIC#${topic}`, sk: `P#${partition}#O#${offset}` })
+            };
+          }
+          // Fallback for old format
+          return {
+            operation: 'GetItem',
+            key: util.dynamodb.toMapValues({ pk: `EVENT#${ctx.args.id}`, sk: `EVENT#${ctx.args.id}` })
+          };
+        }
+        export function response(ctx) {
+          return ctx.result;
+        }
+
+  ListEventsResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: listEvents
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          const { filter, limit, nextToken } = ctx.args;
+          const req = { operation: 'Scan', limit: limit || 20 };
+          if (nextToken) req.nextToken = nextToken;
+          if (filter && filter.topic) {
+            req.filter = {
+              expression: '#topic = :topic',
+              expressionNames: { '#topic': 'topic' },
+              expressionValues: { ':topic': util.dynamodb.toDynamoDB(filter.topic) }
+            };
+          }
+          return req;
+        }
+        export function response(ctx) {
+          return { items: ctx.result.items, nextToken: ctx.result.nextToken, startedAt: util.time.nowEpochSeconds() };
+        }
+
+  QueryEventsByTopicResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: queryEventsByTopic
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          const { topic, startTime, endTime, limit, nextToken } = ctx.args;
+          let expr = '#topic = :topic';
+          const names = { '#topic': 'topic' };
+          const values = { ':topic': util.dynamodb.toDynamoDB(topic) };
+          if (startTime && endTime) {
+            expr += ' AND #ts BETWEEN :st AND :et';
+            names['#ts'] = 'timestamp';
+            values[':st'] = util.dynamodb.toDynamoDB(startTime);
+            values[':et'] = util.dynamodb.toDynamoDB(endTime);
+          } else if (startTime) {
+            expr += ' AND #ts >= :st';
+            names['#ts'] = 'timestamp';
+            values[':st'] = util.dynamodb.toDynamoDB(startTime);
+          }
+          const req = {
+            operation: 'Query',
+            index: 'topic-timestamp-index',
+            query: { expression: expr, expressionNames: names, expressionValues: values },
+            limit: limit || 20,
+            scanIndexForward: false
+          };
+          if (nextToken) req.nextToken = nextToken;
+          return req;
+        }
+        export function response(ctx) {
+          return { items: ctx.result.items, nextToken: ctx.result.nextToken, startedAt: util.time.nowEpochSeconds() };
+        }
+
+  SyncEventsResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: syncEvents
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          const { lastSync, nextToken, limit } = ctx.args;
+          const req = { operation: 'Sync', limit: limit || 100, lastSync: lastSync || 0 };
+          if (nextToken) req.nextToken = nextToken;
+          return req;
+        }
+        export function response(ctx) {
+          return { items: ctx.result.items, nextToken: ctx.result.nextToken, startedAt: ctx.result.startedAt };
+        }
+
+  GetLatestEventsResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getLatestEvents
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          const { topic, limit } = ctx.args;
+          if (topic) {
+            return {
+              operation: 'Query',
+              index: 'topic-timestamp-index',
+              query: {
+                expression: '#topic = :topic',
+                expressionNames: { '#topic': 'topic' },
+                expressionValues: { ':topic': util.dynamodb.toDynamoDB(topic) }
+              },
+              limit: limit || 50,
+              scanIndexForward: false
+            };
+          }
+          return { operation: 'Scan', limit: limit || 50 };
+        }
+        export function response(ctx) {
+          return { items: ctx.result.items, nextToken: ctx.result.nextToken, startedAt: util.time.nowEpochSeconds() };
+        }
+
+  CreateEventResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncGraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: createEvent
+      DataSourceName: !GetAtt EventsTableDataSource.Name
+      Runtime:
+        Name: APPSYNC_JS
+        RuntimeVersion: 1.0.0
+      Code: |
+        import { util } from '@aws-appsync/utils';
+        export function request(ctx) {
+          const ts = util.time.nowEpochSeconds();
+          const topic = ctx.args.topic;
+          const partition = ctx.args.partition || 0;
+          const offset = ctx.args.offset || ts; // Use timestamp as offset if not provided
+          const id = `${topic}-${partition}-${offset}`;
+          const item = {
+            pk: `TOPIC#${topic}`, sk: `P#${partition}#O#${offset}`, id, topic,
+            partition, offset, key: ctx.args.key, data: ctx.args.data, timestamp: ts,
+            processedAt: util.time.nowISO8601(), ttl: ts + 2592000,
+            _version: 1, _lastChangedAt: ts
+          };
+          return {
+            operation: 'PutItem',
+            key: util.dynamodb.toMapValues({ pk: item.pk, sk: item.sk }),
+            attributeValues: util.dynamodb.toMapValues(item)
+          };
+        }
+        export function response(ctx) {
+          return ctx.result;
+        }
+
+  # ==========================================
+  # Lambda Function
+  # ==========================================
+  
+  MSKToAppSyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-msk-to-appsync'
+      Handler: index.lambda_handler
+      CodeUri: lambda/
+      Description: Processes MSK events, publishes to AppSync Event API, and stores in DynamoDB
+      # VpcConfig removed - Lambda runs outside VPC to access AppSync/DynamoDB directly
+      Environment:
+        Variables:
+          APPSYNC_HTTP_ENDPOINT: !Sub 'https://${AppSyncEventsApi.Dns.Http}'
+          APPSYNC_API_KEY: !GetAtt AppSyncApiKey.ApiKey
+          GRAPHQL_ENDPOINT: !GetAtt AppSyncGraphQLApi.GraphQLUrl
+          GRAPHQL_API_KEY: !GetAtt AppSyncGraphQLApiKey.ApiKey
+          EVENTS_TABLE: !Ref EventsTable
+          CLUSTER_NAME: !Ref ClusterName
+          GLUE_REGISTRY_NAME: !Sub '${ClusterName}-registry'
+          SCHEMA_AUTO_REGISTRATION: 'true'
+          HISTORICAL_RETENTION_DAYS: !Ref HistoricalDataRetentionDays
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - kafka:DescribeCluster
+                - kafka:DescribeClusterV2
+                - kafka:GetBootstrapBrokers
+                - kafka-cluster:Connect
+                - kafka-cluster:DescribeCluster
+                - kafka-cluster:DescribeTopic
+                - kafka-cluster:ReadData
+                - kafka-cluster:DescribeGroup
+                - kafka-cluster:AlterGroup
+              Resource:
+                - !Ref MSKClusterArn
+                - !Sub '${MSKClusterArn}/*'
+            - Effect: Allow
+              Action:
+                - kafka-cluster:Connect
+                - kafka-cluster:DescribeTopic
+                - kafka-cluster:ReadData
+              Resource: !Sub 'arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/${ClusterName}/*/*'
+            - Effect: Allow
+              Action:
+                - kafka-cluster:AlterGroup
+                - kafka-cluster:DescribeGroup
+              Resource: !Sub 'arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:group/${ClusterName}/*/*'
+            - Effect: Allow
+              Action:
+                - appsync:EventPublish
+                - appsync:EventSubscribe
+              Resource: !Sub 'arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncEventsApi.ApiId}/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt EventsTable.Arn
+                - !GetAtt DeltaSyncTable.Arn
+            - Effect: Allow
+              Action:
+                - glue:GetRegistry
+                - glue:GetSchema
+                - glue:GetSchemaVersion
+                - glue:GetSchemaByDefinition
+                - glue:CreateSchema
+                - glue:RegisterSchemaVersion
+              Resource:
+                - !Ref GlueRegistryArn
+                - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:schema/${ClusterName}-registry/*'
+            # EC2 permissions required for MSK event source mapping
+            - Effect: Allow
+              Action:
+                - ec2:DescribeSecurityGroups
+                - ec2:DescribeSubnets
+                - ec2:DescribeVpcs
+                - ec2:DescribeNetworkInterfaces
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+              Resource: '*'
+        - VPCAccessPolicy: {}
+      Tags:
+        Name: !Sub '${ClusterName}-msk-to-appsync'
+        Environment: !Ref Environment
+
+  # MSK Event Source Mappings
+  MSKEventSourceTaxiTrips:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref MSKToAppSyncFunction
+      EventSourceArn: !Ref MSKClusterArn
+      Topics:
+        - taxi-trips
+      StartingPosition: LATEST
+      BatchSize: 100
+
+  MSKEventSourceTaxiLocations:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref MSKToAppSyncFunction
+      EventSourceArn: !Ref MSKClusterArn
+      Topics:
+        - taxi-locations
+      StartingPosition: LATEST
+      BatchSize: 100
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ClusterName}-msk-to-appsync'
+      RetentionInDays: 3
+
+Outputs:
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt MSKToAppSyncFunction.Arn
+
+  AppSyncEventApiId:
+    Description: AppSync Event API ID
+    Value: !GetAtt AppSyncEventsApi.ApiId
+
+  AppSyncHttpEndpoint:
+    Description: AppSync HTTP Endpoint for publishing events
+    Value: !Sub 'https://${AppSyncEventsApi.Dns.Http}'
+
+  AppSyncRealtimeEndpoint:
+    Description: AppSync Realtime WebSocket Endpoint
+    Value: !Sub 'wss://${AppSyncEventsApi.Dns.Realtime}'
+
+  AppSyncEventApiKey:
+    Description: AppSync Event API Key
+    Value: !GetAtt AppSyncApiKey.ApiKey
+
+  AppSyncGraphQLApiId:
+    Description: AppSync GraphQL API ID
+    Value: !GetAtt AppSyncGraphQLApi.ApiId
+
+  AppSyncGraphQLEndpoint:
+    Description: AppSync GraphQL Endpoint for historical queries
+    Value: !GetAtt AppSyncGraphQLApi.GraphQLUrl
+
+  AppSyncGraphQLApiKey:
+    Description: AppSync GraphQL API Key
+    Value: !GetAtt AppSyncGraphQLApiKey.ApiKey
+
+  EventsTableName:
+    Description: DynamoDB Events Table Name
+    Value: !Ref EventsTable
+
+  EventsTableArn:
+    Description: DynamoDB Events Table ARN
+    Value: !GetAtt EventsTable.Arn
+
+  DeltaSyncTableName:
+    Description: DynamoDB Delta Sync Table Name
+    Value: !Ref DeltaSyncTable

@@ -1,0 +1,49 @@
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+type Mutation {
+  createEvent(data: AWSJSON!, key: String, offset: Int, partition: Int, topic: String!): TaxiEvent
+}
+
+type Query {
+  getEvent(id: ID!): TaxiEvent
+  getLatestEvents(limit: Int, topic: String): TaxiEventConnection
+  listEvents(filter: EventFilterInput, limit: Int, nextToken: String): TaxiEventConnection
+  queryEventsByTopic(endTime: AWSTimestamp, limit: Int, nextToken: String, startTime: AWSTimestamp, topic: String!): TaxiEventConnection
+  syncEvents(lastSync: AWSTimestamp, limit: Int, nextToken: String): TaxiEventConnection
+}
+
+type Subscription {
+  onCreateEvent(topic: String): TaxiEvent @aws_subscribe(mutations : ["createEvent"])
+}
+
+type TaxiEvent {
+  _deleted: Boolean
+  _lastChangedAt: AWSTimestamp
+  _version: Int
+  data: AWSJSON!
+  id: ID!
+  key: String
+  offset: Int
+  partition: Int
+  processedAt: AWSDateTime!
+  timestamp: AWSTimestamp!
+  topic: String!
+  ttl: Int
+}
+
+type TaxiEventConnection {
+  items: [TaxiEvent]
+  nextToken: String
+  startedAt: AWSTimestamp
+}
+
+input EventFilterInput {
+  endTime: AWSTimestamp
+  key: String
+  startTime: AWSTimestamp
+  topic: String
+}

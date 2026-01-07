@@ -1,0 +1,34 @@
+# Build artifacts
+.aws-sam/
+cloudformation/.aws-sam/
+cloudformation/lambda/package/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Logs
+*.log
+
+# Local settings
+.claude/settings.local.json

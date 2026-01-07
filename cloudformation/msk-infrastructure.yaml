@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon MSK Provisioned Cluster with VPC Infrastructure'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: taxi-kafka-msk
+    Description: Name of the MSK cluster
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  KafkaVersion:
+    Type: String
+    Default: '3.6.0'
+    Description: Apache Kafka version
+
+  BrokerInstanceType:
+    Type: String
+    Default: kafka.m5.large
+    Description: Instance type for MSK brokers
+
+  BrokerEBSVolumeSize:
+    Type: Number
+    Default: 100
+    Description: EBS volume size in GB
+
+  NumberOfBrokerNodes:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    Description: Number of broker nodes (must match number of AZs)
+
+  VpcCIDR:
+    Type: String
+    Default: '10.0.0.0/16'
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Subnets (3 AZs)
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCIDR, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-1'
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCIDR, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-2'
+
+  Subnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCIDR, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-3'
+
+  # Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-rt'
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet1
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet2
+
+  Subnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet3
+
+  # Security Group for MSK
+  MSKSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-msk-sg'
+      GroupDescription: Security group for MSK cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          CidrIp: !Ref VpcCIDR
+          Description: Kafka plaintext
+        - IpProtocol: tcp
+          FromPort: 9094
+          ToPort: 9094
+          CidrIp: !Ref VpcCIDR
+          Description: Kafka TLS
+        - IpProtocol: tcp
+          FromPort: 9096
+          ToPort: 9096
+          CidrIp: !Ref VpcCIDR
+          Description: Kafka SASL/SCRAM
+        - IpProtocol: tcp
+          FromPort: 9098
+          ToPort: 9098
+          CidrIp: !Ref VpcCIDR
+          Description: Kafka IAM
+        - IpProtocol: tcp
+          FromPort: 2181
+          ToPort: 2181
+          CidrIp: !Ref VpcCIDR
+          Description: Zookeeper
+        # Public access port for IAM authentication
+        - IpProtocol: tcp
+          FromPort: 9198
+          ToPort: 9198
+          CidrIp: '0.0.0.0/0'
+          Description: Kafka IAM Public Access
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-msk-sg'
+
+  # KMS Key for encryption
+  MSKKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for MSK cluster encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-kms-key'
+
+  MSKKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ClusterName}-key'
+      TargetKeyId: !Ref MSKKMSKey
+
+  # CloudWatch Log Group
+  MSKLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/msk/${ClusterName}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-logs'
+
+  # S3 Bucket for logs
+  MSKLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ClusterName}-logs-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-logs-bucket'
+
+  # MSK Configuration
+  MSKConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub '${ClusterName}-config'
+      Description: !Sub 'MSK configuration for ${ClusterName}'
+      KafkaVersionsList:
+        - !Ref KafkaVersion
+      ServerProperties: |
+        auto.create.topics.enable=true
+        delete.topic.enable=true
+        log.retention.hours=168
+        num.partitions=3
+        default.replication.factor=3
+        min.insync.replicas=2
+        log.segment.bytes=1073741824
+
+  # MSK Cluster
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: !Ref NumberOfBrokerNodes
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref BrokerInstanceType
+        ClientSubnets:
+          - !Ref Subnet1
+          - !Ref Subnet2
+          - !Ref Subnet3
+        SecurityGroups:
+          - !Ref MSKSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref BrokerEBSVolumeSize
+        # ConnectivityInfo:
+        #   PublicAccess:
+        #     Type: SERVICE_PROVIDED_EIPS
+      ConfigurationInfo:
+        Arn: !Ref MSKConfiguration
+        Revision: 1
+      EncryptionInfo:
+        EncryptionAtRest:
+          DataVolumeKMSKeyId: !Ref MSKKMSKey
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+        Unauthenticated:
+          Enabled: false
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref MSKLogGroup
+          S3:
+            Enabled: true
+            Bucket: !Ref MSKLogsBucket
+            Prefix: logs/msk-
+      OpenMonitoring:
+        Prometheus:
+          JmxExporter:
+            EnabledInBroker: true
+          NodeExporter:
+            EnabledInBroker: true
+      EnhancedMonitoring: PER_BROKER
+      Tags:
+        Name: !Ref ClusterName
+        Environment: !Ref Environment
+
+  # VPC Endpoints for Lambda MSK Event Source
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-vpce-sg'
+      GroupDescription: Security group for VPC Endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCIDR
+          Description: HTTPS from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpce-sg'
+
+  STSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  LambdaEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # Glue Schema Registry
+  GlueSchemaRegistry:
+    Type: AWS::Glue::Registry
+    Properties:
+      Name: !Sub '${ClusterName}-registry'
+      Description: !Sub 'Schema Registry for ${ClusterName} MSK cluster'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-registry'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ClusterName}-VPCId'
+
+  SubnetIds:
+    Description: Subnet IDs
+    Value: !Join [',', [!Ref Subnet1, !Ref Subnet2, !Ref Subnet3]]
+    Export:
+      Name: !Sub '${ClusterName}-SubnetIds'
+
+  MSKSecurityGroupId:
+    Description: MSK Security Group ID
+    Value: !Ref MSKSecurityGroup
+    Export:
+      Name: !Sub '${ClusterName}-MSKSecurityGroupId'
+
+  MSKClusterArn:
+    Description: MSK Cluster ARN
+    Value: !Ref MSKCluster
+    Export:
+      Name: !Sub '${ClusterName}-MSKClusterArn'
+
+  GlueRegistryArn:
+    Description: Glue Schema Registry ARN
+    Value: !Ref GlueSchemaRegistry
+    Export:
+      Name: !Sub '${ClusterName}-GlueRegistryArn'
+
+  KMSKeyArn:
+    Description: KMS Key ARN
+    Value: !GetAtt MSKKMSKey.Arn
+    Export:
+      Name: !Sub '${ClusterName}-KMSKeyArn'
